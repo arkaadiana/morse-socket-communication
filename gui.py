@@ -6,6 +6,7 @@ import winsound
 from pynput.mouse import Listener
 import keyboard
 from morse_dict import MORSE_CODE_DICT, morse_to_text
+import queue
 
 class MorseGUI:
     def __init__(self, root, client=None):
@@ -16,6 +17,9 @@ class MorseGUI:
         
         # Use the provided client if available
         self.client = client
+        
+        # Create a queue for thread-safe communication
+        self.event_queue = queue.Queue()
         
         # Apply modern style
         self.style = ttk.Style()
@@ -32,8 +36,14 @@ class MorseGUI:
         self.setup_gui()
         
         # Start threads
-        threading.Thread(target=self.start_mouse_listener, daemon=True).start()
-        threading.Thread(target=self.check_for_space, daemon=True).start()
+        self.mouse_thread = threading.Thread(target=self.start_mouse_listener, daemon=True)
+        self.mouse_thread.start()
+        
+        self.keyboard_thread = threading.Thread(target=self.check_for_space, daemon=True)
+        self.keyboard_thread.start()
+        
+        # Start periodic checking of the queue (thread-safe UI updates)
+        self.root.after(100, self.process_queue)
         
     def setup_gui(self):
         # Set the window properties
@@ -348,39 +358,82 @@ class MorseGUI:
                                      fg=self.primary_color, 
                                      bg="white")
                 morse_label.pack(side=tk.LEFT)
+    
+    def process_queue(self):
+        """Process UI update events from the queue"""
+        try:
+            while True:
+                # Get event from queue without blocking
+                event = self.event_queue.get_nowait()
+                
+                # Process the event based on its type
+                event_type = event.get('type')
+                
+                if event_type == 'mouse_down':
+                    self.draw_mouse_area(self.secondary_color)
+                    self.status_label.config(text="Recording dot/dash...")
+                
+                elif event_type == 'mouse_up':
+                    symbol = event.get('symbol')
+                    self.morse_code += symbol
+                    self.play_morse_sound(symbol)
+                    self.status_label.config(text=f"Recorded {symbol}")
+                    self.draw_mouse_area(self.bg_color)
+                    self.update_gui()
+                
+                elif event_type == 'word_separator':
+                    self.morse_code += ' / '
+                    self.status_label.config(text="Added word separator")
+                    self.update_gui()
+                
+                elif event_type == 'send_message':
+                    self.send_message()
+                
+                elif event_type == 'set_status':
+                    self.status_label.config(text=event.get('text', ''))
+                
+                # Mark this task as done
+                self.event_queue.task_done()
+                
+        except queue.Empty:
+            # Queue is empty, schedule the next check
+            pass
+        
+        # Schedule the next queue check
+        self.root.after(100, self.process_queue)
             
     def on_click(self, x, y, button, pressed):
-        if button.name == 'left':
-            if pressed:
-                self.start_time = time.time()
-                self.draw_mouse_area(self.secondary_color)
-                self.status_label.config(text="Recording dot/dash...")
-            else:
-                press_duration = time.time() - self.start_time
-                if press_duration < 0.2:
-                    self.morse_code += '.'
-                    self.play_morse_sound('.')
-                    self.status_label.config(text="Recorded dot (.)")
+        try:
+            if button.name == 'left':
+                if pressed:
+                    self.start_time = time.time()
+                    # Queue UI update instead of direct call
+                    self.event_queue.put({'type': 'mouse_down'})
+                    
                 else:
-                    self.morse_code += '-'
-                    self.play_morse_sound('-')
-                    self.status_label.config(text="Recorded dash (-)")
-                self.start_time = 0
-                self.draw_mouse_area(self.bg_color)
-                self.update_gui()
-        elif button.name == 'right':
-            if self.morse_code and not self.morse_code.strip().endswith('/'):
-                self.morse_code += ' / '
-                self.status_label.config(text="Added word separator")
-            self.update_gui()
+                    press_duration = time.time() - self.start_time
+                    symbol = '.' if press_duration < 0.2 else '-'
+                    # Queue UI update instead of direct call
+                    self.event_queue.put({'type': 'mouse_up', 'symbol': symbol})
+                    self.start_time = 0
+                    
+            elif button.name == 'right' and not pressed:
+                if self.morse_code and not self.morse_code.strip().endswith('/'):
+                    # Queue UI update instead of direct call
+                    self.event_queue.put({'type': 'word_separator'})
+        except Exception as e:
+            print(f"Error in on_click: {e}")
             
     def play_morse_sound(self, symbol):
-        if symbol == '.':
-            winsound.Beep(1000, 200)
-        elif symbol == '-':
-            winsound.Beep(1000, 600)
-        else:
-            time.sleep(0.2)
+        try:
+            if symbol == '.':
+                winsound.Beep(1000, 200)
+            elif symbol == '-':
+                winsound.Beep(1000, 600)
+            else:
+                time.sleep(0.2)
+        except Exception as e:
+            print(f"Sound error: {e}")
             
     def draw_mouse_area(self, color):
         self.canvas.delete("all")
@@ -394,8 +447,12 @@ class MorseGUI:
         self.canvas.create_text(150, 100, text=text, fill=self.text_color, font=("Helvetica", 12, "bold"))
         
     def start_mouse_listener(self):
-        with Listener(on_click=self.on_click) as listener:
-            listener.join()
+        try:
+            with Listener(on_click=self.on_click) as listener:
+                listener.join()
+        except Exception as e:
+            print(f"Mouse listener error: {e}")
+            self.event_queue.put({'type': 'set_status', 'text': f"Mouse listener error: {e}"})
             
     def update_gui(self):
         # Update morse code display
@@ -417,11 +474,21 @@ class MorseGUI:
         self.status_label.config(text="Input cleared")
         
     def check_for_space(self):
-        while True:
-            if keyboard.is_pressed('space'):
-                if self.morse_code:
-                    self.send_message()
-            time.sleep(0.1)
+        try:
+            while True:
+                if keyboard.is_pressed('space'):
+                    if self.morse_code:
+                        # Queue the send message event instead of direct call
+                        self.event_queue.put({'type': 'send_message'})
+                        # Small delay to avoid multiple triggers
+                        time.sleep(0.3)
+                    else:
+                        time.sleep(0.1)
+                else:
+                    time.sleep(0.1)
+        except Exception as e:
+            print(f"Keyboard listener error: {e}")
+            self.event_queue.put({'type': 'set_status', 'text': f"Keyboard listener error: {e}"})
             
     def send_message(self):
         if not self.morse_code:
